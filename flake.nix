@@ -119,6 +119,142 @@
             };
           };
 
+        # ── mkScheduledJob ──────────────────────────────────────────────
+        #
+        # Emit a hardened systemd *oneshot* + *timer* pair for periodic
+        # or scheduled work: bank pollers, health probers, snapshot
+        # rotators. Same design as mkPythonService but without the Caddy
+        # site — jobs don't have a public surface. If a job needs a
+        # status/manual-trigger endpoint, expose it on a companion
+        # mkPythonService that shells out to `systemctl start`.
+        #
+        # Manual trigger: `systemctl start <name>.service` on spain
+        # runs the job immediately (out-of-band from the timer).
+        # Observability: `journalctl -u <name>`, `systemctl list-timers
+        # '<name>*'`, `systemctl status <name>.timer`.
+        #
+        # Example:
+        #
+        #   config = lib.mkMerge [
+        #     (gluck-service-lib.lib.mkScheduledJob {
+        #       inherit config lib pkgs;
+        #       name = "gluck-plaid-sync";
+        #       description = "Plaid transactions sync";
+        #       schedule = "*-*-* 00/6:00:00";   # every 6h on the hour
+        #       randomizedDelaySec = "10m";
+        #       execStart = "${pkgs.my-plaid-sync}/bin/plaid-sync";
+        #       runtimePackages = with pkgs; [ python3 curl jq ];
+        #       credentials = {
+        #         plaid_client_id = "/run/secrets/plaid-client-id";
+        #         plaid_secret    = "/run/secrets/plaid-secret";
+        #         plaid_items     = "/run/secrets/plaid-items";
+        #       };
+        #       stateDirectory = "gluck-plaid";
+        #       requireNetwork = true;
+        #     })
+        #   ];
+        mkScheduledJob =
+          {
+            config,
+            lib,
+            pkgs,
+
+            name,                       # e.g. "gluck-plaid-sync"
+            description ? name,
+            schedule,                   # systemd OnCalendar string
+            randomizedDelaySec ? "5m",
+            persistent ? true,          # run on boot if a firing was missed
+            accuracySec ? "1min",
+
+            execStart,                  # command line (string) OR list of strings
+            environment ? { },
+            credentials ? { },          # { name = /path/to/file; } → LoadCredential
+            runtimePackages ? [ ],      # available on PATH inside the job
+
+            stateDirectory ? name,      # /var/lib/<stateDirectory>
+            readWritePaths ? [ ],       # extra ReadWritePaths (mount points, blob dirs, …)
+
+            user ? null,                # null → DynamicUser=true
+            group ? null,
+
+            requireNetwork ? true,
+            after ? [ ],
+            wants ? [ ],
+            requires ? [ ],
+
+            timeoutStartSec ? "15m",    # kill the job if it exceeds this
+            restartOnFailure ? false,   # timers usually handle retries; opt in per job
+            restartSec ? 30,
+
+            extraServiceConfig ? { },
+          }:
+          let
+            netAfter = lib.optionals requireNetwork [ "network-online.target" ];
+            netWants = lib.optionals requireNetwork [ "network-online.target" ];
+
+            execStartValue =
+              if builtins.isList execStart then
+                lib.concatStringsSep " " execStart
+              else
+                execStart;
+
+            loadCredential = lib.mapAttrsToList (n: p: "${n}:${p}") credentials;
+
+            userGroupConfig =
+              if user == null then
+                { DynamicUser = true; }
+              else
+                {
+                  DynamicUser = false;
+                  User = user;
+                  Group = if group == null then user else group;
+                };
+
+            pathEnv = lib.optionalAttrs (runtimePackages != [ ]) {
+              PATH = lib.makeBinPath runtimePackages;
+            };
+          in
+          {
+            systemd.services.${name} = {
+              inherit description;
+              after = netAfter ++ after;
+              wants = netWants ++ wants;
+              inherit requires;
+              # NOT wantedBy = multi-user — the timer is what pulls this in.
+              environment = environment // pathEnv;
+              serviceConfig = defaultHardened // {
+                Type = "oneshot";
+                StateDirectory = stateDirectory;
+                ExecStart = execStartValue;
+                TimeoutStartSec = timeoutStartSec;
+              }
+              // userGroupConfig
+              // lib.optionalAttrs (loadCredential != [ ]) {
+                LoadCredential = loadCredential;
+              }
+              // lib.optionalAttrs (readWritePaths != [ ]) {
+                ReadWritePaths = readWritePaths;
+              }
+              // lib.optionalAttrs restartOnFailure {
+                Restart = "on-failure";
+                RestartSec = restartSec;
+              }
+              // extraServiceConfig;
+            };
+
+            systemd.timers.${name} = {
+              inherit description;
+              wantedBy = [ "timers.target" ];
+              timerConfig = {
+                OnCalendar = schedule;
+                RandomizedDelaySec = randomizedDelaySec;
+                AccuracySec = accuracySec;
+                Persistent = persistent;
+                Unit = "${name}.service";
+              };
+            };
+          };
+
         # A tiny wrapper for the rare service that isn't Python. Skips
         # pythonPackages / entrypoint and takes an ExecStart directly.
         mkService =
