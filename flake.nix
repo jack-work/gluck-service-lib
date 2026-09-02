@@ -257,6 +257,24 @@
 
         # A tiny wrapper for the rare service that isn't Python. Skips
         # pythonPackages / entrypoint and takes an ExecStart directly.
+        #
+        # DynamicUser is the default and the right choice for a service that
+        # owns nothing but its own StateDirectory: systemd allocates the uid
+        # at start, re-chowns the state, and nothing outlives the unit.
+        #
+        # Set `user` when the service needs a *stable* identity, which is a
+        # narrower case than it first appears. The two real reasons:
+        #
+        #   - a sops secret with `owner = "<user>"`, since a DynamicUser's
+        #     uid does not exist at activation time when sops-nix chowns;
+        #   - a long-lived store shared with another unit, or files that must
+        #     survive with a meaningful owner. A DynamicUser's uid is
+        #     recycled, which is how a directory ends up owned by a number
+        #     with no name behind it.
+        #
+        # Prefer `LoadCredential` over a fixed user: it lands the secret in a
+        # per-unit tmpfs at 0400, needs no chown ordering, and keeps
+        # DynamicUser. Reach for `user` only when that is not enough.
         mkService =
           {
             config,
@@ -274,20 +292,54 @@
             stateDirectory ? name,
             after ? [ "network.target" ],
             wants ? [ ],
+
+            # Fixed identity. null (default) means DynamicUser.
+            user ? null,
+            group ? null,
+            # Create the user/group declaratively. Turn this off when the
+            # account is defined elsewhere (an upstream module, or shared
+            # with another service).
+            createUser ? true,
           }:
+          let
+            fixedIdentity = user != null;
+            groupName = if group != null then group else user;
+          in
           {
+            users.users = lib.mkIf (fixedIdentity && createUser) {
+              ${user} = {
+                isSystemUser = true;
+                group = groupName;
+                description = "${name} service account";
+              };
+            };
+            users.groups = lib.mkIf (fixedIdentity && createUser && group == null) {
+              ${user} = { };
+            };
+
             systemd.services.${name} = {
               description = "${name} — via gluck-service-lib";
               inherit after wants;
               wantedBy = [ "multi-user.target" ];
               environment = { PORT = toString port; } // environment;
-              serviceConfig = defaultHardened // {
-                DynamicUser = true;
-                StateDirectory = stateDirectory;
-                ExecStart = execStart;
-                Restart = "on-failure";
-                RestartSec = 5;
-              } // extraServiceConfig;
+              serviceConfig =
+                defaultHardened
+                // {
+                  StateDirectory = stateDirectory;
+                  ExecStart = execStart;
+                  Restart = "on-failure";
+                  RestartSec = 5;
+                }
+                // (
+                  if fixedIdentity then
+                    {
+                      User = user;
+                      Group = groupName;
+                    }
+                  else
+                    { DynamicUser = true; }
+                )
+                // extraServiceConfig;
             };
 
             services.kelliher-web.sites.${name} = {
