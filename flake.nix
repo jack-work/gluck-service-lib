@@ -33,6 +33,19 @@
         LockPersonality = true;
         SystemCallArchitectures = "native";
       };
+      upstream =
+        { name, port, socket }:
+        assert (socket != (port != null)) || throw "${name}: set exactly one of port and socket";
+        if socket then
+          {
+            listenEnv = { KWEB_LISTEN = "socket"; };
+            siteUpstream = { proxySocket = "${name}.service"; };
+          }
+        else
+          {
+            listenEnv = { PORT = toString port; };
+            siteUpstream = { proxyTo = port; };
+          };
     in
     {
       lib = rec {
@@ -74,7 +87,8 @@
             name,           # e.g. "gluck-calendar"
             subdomain,      # e.g. "cal"       → cal.<baseDomain>
             extraHostnames ? [ ],
-            port,           # loopback port the app binds
+            port ? null,
+            socket ? false,
             requireAuth ? true,
             requiredGroups ? [ ],
 
@@ -93,15 +107,14 @@
           }:
           let
             py = pkgs.python3.withPackages pythonPackages;
+            inherit (upstream { inherit name port socket; }) listenEnv siteUpstream;
           in
           {
             systemd.services.${name} = {
               description = "${name} — via gluck-service-lib";
               inherit after wants;
               wantedBy = [ "multi-user.target" ];
-              environment = {
-                PORT = toString port;
-              } // environment;
+              environment = listenEnv // environment;
               serviceConfig = defaultHardened // {
                 DynamicUser = true;
                 StateDirectory = stateDirectory;
@@ -115,8 +128,7 @@
               subdomains = [ subdomain ];
               hostnames = extraHostnames;
               inherit requireAuth requiredGroups;
-              proxyTo = port;
-            };
+            } // siteUpstream;
           };
 
         # ── mkScheduledJob ──────────────────────────────────────────────
@@ -283,7 +295,8 @@
             name,
             subdomain,
             extraHostnames ? [ ],
-            port,
+            port ? null,
+            socket ? false,
             requireAuth ? true,
             requiredGroups ? [ ],
             execStart,
@@ -302,6 +315,7 @@
             createUser ? true,
           }:
           let
+            inherit (upstream { inherit name port socket; }) listenEnv siteUpstream;
             fixedIdentity = user != null;
             groupName = if group != null then group else user;
           in
@@ -321,7 +335,7 @@
               description = "${name} — via gluck-service-lib";
               inherit after wants;
               wantedBy = [ "multi-user.target" ];
-              environment = { PORT = toString port; } // environment;
+              environment = listenEnv // environment;
               serviceConfig =
                 defaultHardened
                 // {
@@ -346,8 +360,7 @@
               subdomains = [ subdomain ];
               hostnames = extraHostnames;
               inherit requireAuth requiredGroups;
-              proxyTo = port;
-            };
+            } // siteUpstream;
           };
       };
     };
